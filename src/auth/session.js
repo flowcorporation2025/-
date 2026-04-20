@@ -81,7 +81,9 @@ async function saveSession(context) {
 async function isLoggedIn(page, targetUrl = TIKTOK_SELLER_URL) {
   try {
     await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
-    await page.waitForTimeout(2000);
+    // Wait for potential client-side (SPA) redirects to complete
+    await page.waitForLoadState('networkidle', { timeout: 10000 }).catch(() => null);
+    await page.waitForTimeout(1000);
     return !isLoginUrl(page.url());
   } catch {
     return false;
@@ -108,16 +110,26 @@ async function performLogin(page, timeoutMs = 5 * 60 * 1000) {
 
   await page.goto(TIKTOK_SELLER_URL, { waitUntil: 'domcontentloaded', timeout: 30000 });
 
-  // Wait until the page URL is no longer a login/passport URL
+  // Wait until the URL leaves any login/passport page
   logger.info('ログイン完了を待機中... (最大5分)');
   await page.waitForURL(
     (url) => !isLoginUrl(url.href),
     { timeout: timeoutMs, waitUntil: 'domcontentloaded' }
   );
 
-  // Extra buffer for post-login redirects to settle
-  await page.waitForTimeout(2000);
-  logger.info(`ログイン検知: ${page.url()}`);
+  // Wait for the dashboard to fully settle:
+  // - networkidle ensures background XHR/fetch (including cookie-setting requests) finish
+  // - extra 3s buffer for any remaining async JS
+  logger.info('ダッシュボード読み込み中...');
+  await page.waitForLoadState('networkidle', { timeout: 15000 }).catch(() => null);
+  await page.waitForTimeout(3000);
+
+  // Sanity check: confirm we did NOT end up back on a login page
+  const finalUrl = page.url();
+  if (isLoginUrl(finalUrl)) {
+    throw new Error('ログイン後にログインページへ戻りました。CAPTCHA / 2段階認証が未完了の可能性があります。');
+  }
+  logger.info(`ログイン完了確認: ${finalUrl}`);
 }
 
 // ── Public API ────────────────────────────────────────────────────────────────
@@ -139,10 +151,47 @@ async function runLoginFlow() {
   try {
     await performLogin(page);
     await saveSession(context);
-    logger.info('セッション保存完了。次回からは自動ログインが使用されます。');
+    logger.info('セッションファイル書き込み完了。検証中...');
   } finally {
     await context.close().catch(() => null);
     await browser.close().catch(() => null);
+  }
+
+  // ── Verify the saved session file with a brand-new browser context ──────────
+  // This is the only reliable test: load the exact file that was just written,
+  // navigate to the seller top, and confirm we are NOT redirected to login.
+  const verifyBrowser = await launchBrowser({ headless: true });
+  try {
+    const verifyContext = await verifyBrowser.newContext({
+      storageState: SESSION_FILE,
+      viewport: { width: 1280, height: 800 },
+      userAgent:
+        'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 ' +
+        '(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+      locale: 'ja-JP',
+      timezoneId: 'Asia/Tokyo',
+    });
+    const verifyPage = await verifyContext.newPage();
+
+    await verifyPage.goto(TIKTOK_SELLER_URL, { waitUntil: 'domcontentloaded', timeout: 30000 });
+    await verifyPage.waitForLoadState('networkidle', { timeout: 10000 }).catch(() => null);
+    await verifyPage.waitForTimeout(1000);
+
+    const verifyUrl = verifyPage.url();
+    await verifyContext.close().catch(() => null);
+
+    if (isLoginUrl(verifyUrl)) {
+      // Delete the invalid session file so stale data doesn't interfere next time
+      fs.rmSync(SESSION_FILE, { force: true });
+      throw new Error(
+        'セッション検証に失敗しました（保存後もログインページに遷移します）。\n' +
+        '再度 npm run login を実行し、ダッシュボードが完全に表示された状態で待ってください。'
+      );
+    }
+
+    logger.info('セッション検証OK。次回から自動ログインが使用されます。');
+  } finally {
+    await verifyBrowser.close().catch(() => null);
   }
 }
 
