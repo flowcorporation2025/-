@@ -8,7 +8,9 @@
     "invite": "node src/index.js --task=invite",
     "recovery": "node src/index.js --task=recovery",
     "login": "node src/index.js --task=login",
-    "report": "node src/index.js --task=report"
+    "report": "node src/index.js --task=report",
+    "weekly-report": "node src/index.js --task=weekly-report",
+    "monthly-report": "node src/index.js --task=monthly-report"
   },
   "dependencies": {
     "playwright": "^1.44.0",
@@ -17,7 +19,8 @@
     "dotenv": "^16.4.5",
     "axios": "^1.7.2",
     "winston": "^3.13.0",
-    "dayjs": "^1.11.11"
+    "dayjs": "^1.11.11",
+    "@anthropic-ai/sdk": "^0.27.0"
   },
   "engines": {
     "node": ">=18.0.0"

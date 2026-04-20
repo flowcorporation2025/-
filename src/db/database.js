@@ -15,6 +15,7 @@ function getDb() {
     db.pragma('journal_mode = WAL');
     db.pragma('foreign_keys = ON');
     initSchema();
+    migrate();
   }
   return db;
 }
@@ -34,6 +35,7 @@ function initSchema() {
       status TEXT DEFAULT 'pending' CHECK(status IN ('pending', 'accepted', 'rejected', 'expired')),
       accepted_at TEXT,
       sales_amount INTEGER DEFAULT 0,
+      gmv_amount INTEGER DEFAULT 0,
       updated_at TEXT DEFAULT (datetime('now'))
     );
 
@@ -45,6 +47,8 @@ function initSchema() {
       total_sent INTEGER DEFAULT 0,
       letter1_target INTEGER DEFAULT 50,
       letter2_target INTEGER DEFAULT 50,
+      total_sales INTEGER DEFAULT 0,
+      total_gmv INTEGER DEFAULT 0,
       completed INTEGER DEFAULT 0,
       error_message TEXT,
       created_at TEXT DEFAULT (datetime('now'))
@@ -75,29 +79,46 @@ function initSchema() {
   logger.info('データベース初期化完了');
 }
 
+// Idempotent column additions for existing databases
+function migrate() {
+  const alterations = [
+    `ALTER TABLE creator_invitations ADD COLUMN gmv_amount INTEGER DEFAULT 0`,
+    `ALTER TABLE invitation_runs ADD COLUMN total_sales INTEGER DEFAULT 0`,
+    `ALTER TABLE invitation_runs ADD COLUMN total_gmv INTEGER DEFAULT 0`,
+  ];
+  for (const sql of alterations) {
+    try {
+      db.exec(sql);
+    } catch {
+      // Column already exists — safe to ignore
+    }
+  }
+}
+
 // ── Creator Invitation ──────────────────────────────────────────
 
 function startInvitationRun(runDate) {
   const db = getDb();
-  const stmt = db.prepare(`
+  const result = db.prepare(`
     INSERT INTO invitation_runs (run_date, created_at)
     VALUES (?, datetime('now'))
-  `);
-  const result = stmt.run(runDate);
+  `).run(runDate);
   return result.lastInsertRowid;
 }
 
 function updateInvitationRun(runId, data) {
   const db = getDb();
-  const stmt = db.prepare(`
+  db.prepare(`
     UPDATE invitation_runs
-    SET letter1_sent = ?, letter2_sent = ?, total_sent = ?, completed = ?, error_message = ?
+    SET letter1_sent = ?, letter2_sent = ?, total_sent = ?,
+        total_sales = ?, total_gmv = ?, completed = ?, error_message = ?
     WHERE id = ?
-  `);
-  stmt.run(
+  `).run(
     data.letter1Sent ?? 0,
     data.letter2Sent ?? 0,
     data.totalSent ?? 0,
+    data.totalSales ?? 0,
+    data.totalGmv ?? 0,
     data.completed ? 1 : 0,
     data.errorMessage ?? null,
     runId
@@ -106,13 +127,12 @@ function updateInvitationRun(runId, data) {
 
 function recordInvitation(data) {
   const db = getDb();
-  const stmt = db.prepare(`
+  db.prepare(`
     INSERT INTO creator_invitations
       (creator_id, creator_name, creator_handle, avg_views, gmv, engagement_rate,
        invitation_letter, invited_at, status)
     VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now'), 'pending')
-  `);
-  stmt.run(
+  `).run(
     data.creatorId,
     data.creatorName ?? null,
     data.creatorHandle ?? null,
@@ -123,33 +143,17 @@ function recordInvitation(data) {
   );
 }
 
-function updateInvitationStatus(creatorId, status, salesAmount = 0) {
+function updateInvitationStatus(creatorId, status, salesAmount = 0, gmvAmount = 0) {
   const db = getDb();
-  const stmt = db.prepare(`
+  db.prepare(`
     UPDATE creator_invitations
     SET status = ?,
         accepted_at = CASE WHEN ? = 'accepted' THEN datetime('now') ELSE accepted_at END,
         sales_amount = ?,
+        gmv_amount = ?,
         updated_at = datetime('now')
     WHERE creator_id = ? AND status = 'pending'
-  `);
-  stmt.run(status, status, salesAmount, creatorId);
-}
-
-function getInvitationStats(days = 30) {
-  const db = getDb();
-  return db.prepare(`
-    SELECT
-      COUNT(*) AS total_invited,
-      SUM(CASE WHEN status = 'accepted' THEN 1 ELSE 0 END) AS accepted,
-      SUM(CASE WHEN status = 'rejected' THEN 1 ELSE 0 END) AS rejected,
-      ROUND(
-        100.0 * SUM(CASE WHEN status = 'accepted' THEN 1 ELSE 0 END) / COUNT(*), 2
-      ) AS acceptance_rate,
-      SUM(sales_amount) AS total_sales
-    FROM creator_invitations
-    WHERE invited_at >= datetime('now', '-' || ? || ' days')
-  `).get(days);
+  `).run(status, status, salesAmount, gmvAmount, creatorId);
 }
 
 function wasInvitedRecently(creatorId, withinDays = 30) {
@@ -160,6 +164,106 @@ function wasInvitedRecently(creatorId, withinDays = 30) {
     LIMIT 1
   `).get(creatorId, withinDays);
   return !!row;
+}
+
+// ── Reporting Queries ───────────────────────────────────────────
+
+function getInvitationStats(days = 30) {
+  const db = getDb();
+  return db.prepare(`
+    SELECT
+      COUNT(*) AS total_invited,
+      SUM(CASE WHEN status = 'accepted' THEN 1 ELSE 0 END) AS accepted,
+      SUM(CASE WHEN status = 'rejected' THEN 1 ELSE 0 END) AS rejected,
+      ROUND(
+        100.0 * SUM(CASE WHEN status = 'accepted' THEN 1 ELSE 0 END) / MAX(COUNT(*), 1), 2
+      ) AS acceptance_rate,
+      ROUND(
+        100.0 * SUM(CASE WHEN sales_amount > 0 THEN 1 ELSE 0 END) / MAX(COUNT(*), 1), 2
+      ) AS conversion_rate,
+      SUM(sales_amount) AS total_sales,
+      SUM(gmv_amount) AS total_gmv
+    FROM creator_invitations
+    WHERE invited_at >= datetime('now', '-' || ? || ' days')
+  `).get(days);
+}
+
+function getWeeklyStats(weeksAgo = 0) {
+  const db = getDb();
+  // ISO week: Monday=start
+  const offset = weeksAgo * 7;
+  return db.prepare(`
+    SELECT
+      COUNT(*) AS total_invited,
+      SUM(CASE WHEN status = 'accepted' THEN 1 ELSE 0 END) AS accepted,
+      ROUND(
+        100.0 * SUM(CASE WHEN status = 'accepted' THEN 1 ELSE 0 END) / MAX(COUNT(*), 1), 2
+      ) AS acceptance_rate,
+      ROUND(
+        100.0 * SUM(CASE WHEN sales_amount > 0 THEN 1 ELSE 0 END) / MAX(COUNT(*), 1), 2
+      ) AS conversion_rate,
+      COALESCE(SUM(sales_amount), 0) AS total_sales,
+      COALESCE(SUM(gmv_amount), 0) AS total_gmv
+    FROM creator_invitations
+    WHERE invited_at >= datetime('now', 'weekday 1', '-' || (7 + ?) || ' days')
+      AND invited_at <  datetime('now', 'weekday 1', '-' || ? || ' days')
+  `).get(offset, offset);
+}
+
+function getMonthlyStats(monthsAgo = 0) {
+  const db = getDb();
+  return db.prepare(`
+    SELECT
+      COUNT(*) AS total_invited,
+      SUM(CASE WHEN status = 'accepted' THEN 1 ELSE 0 END) AS accepted,
+      ROUND(
+        100.0 * SUM(CASE WHEN status = 'accepted' THEN 1 ELSE 0 END) / MAX(COUNT(*), 1), 2
+      ) AS acceptance_rate,
+      ROUND(
+        100.0 * SUM(CASE WHEN sales_amount > 0 THEN 1 ELSE 0 END) / MAX(COUNT(*), 1), 2
+      ) AS conversion_rate,
+      COALESCE(SUM(sales_amount), 0) AS total_sales,
+      COALESCE(SUM(gmv_amount), 0) AS total_gmv
+    FROM creator_invitations
+    WHERE strftime('%Y-%m', invited_at) = strftime('%Y-%m', datetime('now', '-' || ? || ' months'))
+  `).get(monthsAgo);
+}
+
+function getViolationStats(days = 7) {
+  const db = getDb();
+  return db.prepare(`
+    SELECT
+      COUNT(*) AS total_violations,
+      SUM(CASE WHEN reapply_status = 'recovered' THEN 1 ELSE 0 END) AS recovered_count,
+      SUM(CASE WHEN reapply_status = 'failed' THEN 1 ELSE 0 END) AS failed_count,
+      ROUND(
+        AVG(
+          CASE WHEN recovery_at IS NOT NULL AND reapplied_at IS NOT NULL
+          THEN (julianday(recovery_at) - julianday(detected_at)) * 24 * 60
+          END
+        ), 1
+      ) AS avg_recovery_minutes
+    FROM product_violations
+    WHERE detected_at >= datetime('now', '-' || ? || ' days')
+  `).get(days);
+}
+
+function getViolationStatsForPeriod(startDate, endDate) {
+  const db = getDb();
+  return db.prepare(`
+    SELECT
+      COUNT(*) AS total_violations,
+      SUM(CASE WHEN reapply_status = 'recovered' THEN 1 ELSE 0 END) AS recovered_count,
+      ROUND(
+        AVG(
+          CASE WHEN recovery_at IS NOT NULL
+          THEN (julianday(recovery_at) - julianday(detected_at)) * 24 * 60
+          END
+        ), 1
+      ) AS avg_recovery_minutes
+    FROM product_violations
+    WHERE detected_at >= ? AND detected_at < ?
+  `).get(startDate, endDate);
 }
 
 // ── Product Violation ───────────────────────────────────────────
@@ -174,18 +278,17 @@ function recordViolation(data) {
 
   if (existing) return existing.id;
 
-  const stmt = db.prepare(`
+  const result = db.prepare(`
     INSERT INTO product_violations
       (product_id, product_name, violation_type, detected_at, reapply_status)
     VALUES (?, ?, ?, datetime('now'), 'pending')
-  `);
-  const result = stmt.run(data.productId, data.productName ?? null, data.violationType ?? null);
+  `).run(data.productId, data.productName ?? null, data.violationType ?? null);
   return result.lastInsertRowid;
 }
 
 function updateViolationStatus(id, status, extra = {}) {
   const db = getDb();
-  const stmt = db.prepare(`
+  db.prepare(`
     UPDATE product_violations
     SET reapply_status = ?,
         reapplied_at = CASE WHEN ? = 'submitted' THEN datetime('now') ELSE reapplied_at END,
@@ -193,18 +296,16 @@ function updateViolationStatus(id, status, extra = {}) {
         notified = ?,
         updated_at = datetime('now')
     WHERE id = ?
-  `);
-  stmt.run(status, status, status, extra.notified ? 1 : 0, id);
+  `).run(status, status, status, extra.notified ? 1 : 0, id);
 }
 
 function logMonitorRun(data) {
   const db = getDb();
-  const stmt = db.prepare(`
+  db.prepare(`
     INSERT INTO product_monitor_logs
       (checked_at, total_products, violated_count, reapplied_count, error_message)
     VALUES (datetime('now'), ?, ?, ?, ?)
-  `);
-  stmt.run(
+  `).run(
     data.totalProducts ?? 0,
     data.violatedCount ?? 0,
     data.reappliedCount ?? 0,
@@ -227,8 +328,12 @@ module.exports = {
   updateInvitationRun,
   recordInvitation,
   updateInvitationStatus,
-  getInvitationStats,
   wasInvitedRecently,
+  getInvitationStats,
+  getWeeklyStats,
+  getMonthlyStats,
+  getViolationStats,
+  getViolationStatsForPeriod,
   recordViolation,
   updateViolationStatus,
   logMonitorRun,
