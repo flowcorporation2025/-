@@ -1,18 +1,19 @@
+'use strict';
 const { getAuthenticatedPage, TIKTOK_SELLER_URL } = require('../auth/session');
-const db = require('../db/database');
+const sheets = require('../sheets/googleSheets');
 const {
   notifyProductViolation,
   notifyProductRecovered,
   notifyError,
 } = require('../notifications/notify');
 const logger = require('../utils/logger');
+const dayjs = require('dayjs');
 
 const PRODUCT_LIST_URL = `${TIKTOK_SELLER_URL}/product/list`;
 
-// Selectors for product listing page - adjust if TikTok updates their UI
 const SELECTORS = {
   productRow: '[data-testid="product-row"], .product-list-item, tr[data-product-id]',
-  productId: '[data-testid="product-id"], [data-product-id], td:first-child',
+  productId:  '[data-testid="product-id"], [data-product-id], td:first-child',
   productName: '[data-testid="product-name"], .product-name, td:nth-child(2)',
   statusBadge: '[data-testid="product-status"], .status-badge, .product-status',
   reapplyBtn:
@@ -24,22 +25,14 @@ const SELECTORS = {
 };
 
 const VIOLATION_KEYWORDS = [
-  '非公開',
-  '違反',
-  'violation',
-  'suspended',
-  'delisted',
-  'removed',
-  'prohibited',
-  'ガイドライン',
-  'guideline',
-  'banned',
+  '非公開', '違反', 'violation', 'suspended', 'delisted',
+  'removed', 'prohibited', 'ガイドライン', 'guideline', 'banned',
 ];
 
-function isViolationStatus(statusText) {
-  if (!statusText) return false;
-  const lower = statusText.toLowerCase();
-  return VIOLATION_KEYWORDS.some((kw) => lower.includes(kw.toLowerCase()));
+function isViolationStatus(text) {
+  if (!text) return false;
+  const lower = text.toLowerCase();
+  return VIOLATION_KEYWORDS.some((kw) => lower.includes(kw));
 }
 
 async function sleep(ms) {
@@ -50,7 +43,6 @@ async function navigateToProductList(page) {
   await page.goto(PRODUCT_LIST_URL, { waitUntil: 'networkidle', timeout: 60000 });
   await page.waitForTimeout(2000);
 
-  // Click violation tab if available to narrow down to violated products
   const violationTab = page.locator(SELECTORS.violationTab).first();
   if (await violationTab.isVisible({ timeout: 3000 }).catch(() => false)) {
     await violationTab.click();
@@ -71,6 +63,8 @@ async function scrapeProductsOnPage(page) {
         (await row.getAttribute('data-product-id')) ??
         (await row.locator(SELECTORS.productId).first().textContent().catch(() => null))?.trim();
 
+      if (!productId) continue;
+
       const productName = (
         await row.locator(SELECTORS.productName).first().textContent().catch(() => null)
       )?.trim();
@@ -78,8 +72,6 @@ async function scrapeProductsOnPage(page) {
       const statusText = (
         await row.locator(SELECTORS.statusBadge).first().textContent().catch(() => null)
       )?.trim();
-
-      if (!productId) continue;
 
       products.push({
         productId,
@@ -92,7 +84,6 @@ async function scrapeProductsOnPage(page) {
       logger.debug(`商品行解析エラー: ${err.message}`);
     }
   }
-
   return products;
 }
 
@@ -100,46 +91,41 @@ async function attemptReapply(page, product) {
   try {
     logger.info(`再申請試行: ${product.productName} (${product.productId})`);
 
-    const reapplyBtn = product.row.locator(SELECTORS.reapplyBtn).first();
+    let reapplyBtn = product.row.locator(SELECTORS.reapplyBtn).first();
 
     if (!await reapplyBtn.isVisible({ timeout: 3000 })) {
-      // Try clicking into product detail for reapply button
+      // Navigate into product detail page to find the button
       await product.row.locator(SELECTORS.productName).first().click();
       await page.waitForTimeout(1500);
 
-      const detailReapplyBtn = page.locator(SELECTORS.reapplyBtn).first();
-      if (!await detailReapplyBtn.isVisible({ timeout: 5000 })) {
+      reapplyBtn = page.locator(SELECTORS.reapplyBtn).first();
+      if (!await reapplyBtn.isVisible({ timeout: 5000 })) {
         logger.warn(`再申請ボタンが見つかりません: ${product.productName}`);
         await page.goBack({ waitUntil: 'domcontentloaded' });
         await page.waitForTimeout(1500);
         return false;
       }
-      await detailReapplyBtn.click();
-    } else {
-      await reapplyBtn.click();
     }
 
+    await reapplyBtn.click();
     await page.waitForTimeout(1000);
 
-    // Handle confirmation modal if present
-    const confirmModal = page.locator('[role="dialog"], .confirm-modal').first();
-    if (await confirmModal.isVisible({ timeout: 3000 }).catch(() => false)) {
-      const confirmBtn = confirmModal.locator(
-        'button:has-text("確認"), button:has-text("Confirm"), button:has-text("送信"), button:has-text("Submit")'
-      ).first();
+    // Confirmation modal
+    const modal = page.locator('[role="dialog"], .confirm-modal').first();
+    if (await modal.isVisible({ timeout: 3000 }).catch(() => false)) {
+      const confirmBtn = modal
+        .locator('button:has-text("確認"), button:has-text("Confirm"), button:has-text("送信"), button:has-text("Submit")')
+        .first();
       if (await confirmBtn.isVisible()) {
         await confirmBtn.click();
         await page.waitForTimeout(1000);
       }
     }
 
-    // Wait for success feedback
-    await page.waitForSelector(
-      'text=申請完了, text=submitted, text=success, .success-toast',
-      { timeout: 8000 }
-    ).catch(() => null);
+    await page
+      .waitForSelector('text=申請完了, text=submitted, text=success, .success-toast', { timeout: 8000 })
+      .catch(() => null);
 
-    // Navigate back to list if we went to detail page
     if (!page.url().includes('/list')) {
       await page.goto(PRODUCT_LIST_URL, { waitUntil: 'domcontentloaded', timeout: 30000 });
       await page.waitForTimeout(1500);
@@ -153,89 +139,102 @@ async function attemptReapply(page, product) {
   }
 }
 
+// ── Main ──────────────────────────────────────────────────────────────────────
+
 async function runProductRecovery() {
   logger.info('=== 商品ステータス監視・復旧 開始 ===');
 
   let browser, context, page;
-  const monitorData = {
-    totalProducts: 0,
-    violatedCount: 0,
-    reappliedCount: 0,
-    errorMessage: null,
-  };
+  const summary = { totalProducts: 0, violatedCount: 0, reappliedCount: 0 };
 
   try {
     ({ browser, context, page } = await getAuthenticatedPage(PRODUCT_LIST_URL));
     await navigateToProductList(page);
 
     let pageNum = 1;
-    let hasNextPage = true;
+    let hasNext = true;
 
-    while (hasNextPage) {
-      logger.info(`商品一覧 ページ${pageNum} を確認中...`);
+    while (hasNext) {
+      logger.info(`商品一覧 p.${pageNum} 確認中...`);
       const products = await scrapeProductsOnPage(page);
-      monitorData.totalProducts += products.length;
+      summary.totalProducts += products.length;
 
       const violated = products.filter((p) => p.isViolated);
-      monitorData.violatedCount += violated.length;
+      summary.violatedCount += violated.length;
 
-      if (violated.length > 0) {
-        logger.info(`違反商品 ${violated.length}件 を検知`);
-      }
+      if (violated.length > 0) logger.info(`違反商品 ${violated.length}件 を検知`);
 
       for (const product of violated) {
-        const violationId = db.recordViolation({
+        const detectedAt = dayjs().format('YYYY-MM-DD HH:mm:ss');
+
+        // Record in Sheets③ (status='submitted')
+        await sheets.appendViolationRow({
           productId: product.productId,
           productName: product.productName,
           violationType: product.statusText,
+          detectedAt,
         });
 
-        // Notify detection
+        // Chatwork alert
         await notifyProductViolation(product);
-        db.updateViolationStatus(violationId, 'submitted', { notified: true });
 
-        // Attempt reapply
+        // Attempt re-application
+        const reappliedAt = dayjs().format('YYYY-MM-DD HH:mm:ss');
         const reapplied = await attemptReapply(page, product);
+
         if (reapplied) {
-          monitorData.reappliedCount++;
-          db.updateViolationStatus(violationId, 'recovered', { notified: true });
+          summary.reappliedCount++;
+          const recoveryAt = dayjs().format('YYYY-MM-DD HH:mm:ss');
+          const recoveryMinutes = dayjs(recoveryAt).diff(dayjs(detectedAt), 'minute');
+
+          await sheets.updateViolationRow(product.productId, {
+            reappliedAt,
+            recoveryAt,
+            recoveryMinutes,
+            status: 'recovered',
+          });
+
           await notifyProductRecovered(product);
         } else {
-          db.updateViolationStatus(violationId, 'failed', { notified: true });
+          await sheets.updateViolationRow(product.productId, {
+            reappliedAt,
+            recoveryAt: '',
+            recoveryMinutes: '',
+            status: 'failed',
+          });
         }
 
         await sleep(2000);
       }
 
-      // Go to next page
+      // Pagination
       const nextBtn = page.locator(SELECTORS.nextPageBtn).first();
-      const canNext = await nextBtn.isVisible().catch(() => false) &&
-        !await nextBtn.isDisabled().catch(() => true);
+      const canNext =
+        (await nextBtn.isVisible().catch(() => false)) &&
+        !(await nextBtn.isDisabled().catch(() => true));
 
       if (canNext && products.length > 0) {
         await nextBtn.click();
         await page.waitForTimeout(2000);
         pageNum++;
       } else {
-        hasNextPage = false;
+        hasNext = false;
       }
     }
 
     logger.info(
-      `監視完了: 全${monitorData.totalProducts}件 / 違反${monitorData.violatedCount}件 / 再申請${monitorData.reappliedCount}件`
+      `監視完了: 全${summary.totalProducts}件 / 違反${summary.violatedCount}件 / 再申請${summary.reappliedCount}件`
     );
   } catch (err) {
     logger.error(`商品復旧エラー: ${err.message}`);
-    monitorData.errorMessage = err.message;
     await notifyError('商品自動復旧', err);
     throw err;
   } finally {
-    db.logMonitorRun(monitorData);
     await context?.close().catch(() => null);
     await browser?.close().catch(() => null);
   }
 
-  return monitorData;
+  return summary;
 }
 
 module.exports = { runProductRecovery };

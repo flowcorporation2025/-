@@ -1,95 +1,92 @@
-# TikTok Shop 自動運用 Bot v2.0
+# TikTok Shop 自動運用 Bot v3.0
 
-Playwright (Node.js) を使用した TikTok Shop アフィリエイトセンターの自動化 Bot。
+Playwright (Node.js) + Google Sheets API + Chatwork + Claude AI による TikTok Shop 完全自動運用 Bot。
 
-## 機能
+## 機能一覧
 
 | 機能 | 説明 | スケジュール |
 |------|------|-------------|
-| クリエイター自動招待 | 条件でフィルタリングし、招待状①②で各50人・計100人に招待を送る | 毎日 10:00 JST |
-| 商品自動復旧 | 違反で非公開になった商品を検知し再申請。Chatwork で即時通知 | 30分ごと |
-| 週次レポート | KPI集計 + Claude AIによる分析・改善提案を Chatwork へ送付 | 毎週月曜 09:00 JST |
-| 月次レポート | KPI集計 + Claude AIによる分析・改善提案を Chatwork へ送付 | 毎月1日 09:00 JST |
+| ①クリエイター自動招待 | 条件フィルタリング後、招待状①②で各50人・計100人に招待。結果をSheets①②に記録 | 毎日 10:00 JST |
+| ②商品自動復旧 | 違反商品を検知し再申請、Sheets③に記録、Chatworkで即時通知 | 30分ごと |
+| ③Sheetsデータ蓄積 | 日次/売上/違反/週次/月次の5シートに自動蓄積 | 各機能実行時 |
+| ④週次レポート | KPI集計＋Claude AI分析→Chatworkへ。Sheets④に記録 | 毎週月曜 09:00 JST |
+| ⑤月次レポート | KPI集計＋Claude AI分析→Chatworkへ。Sheets⑤に記録 | 毎月1日 09:00 JST |
 
 ## セットアップ
 
+### 1. 依存パッケージ & ブラウザ
 ```bash
-# 1. 依存パッケージインストール
 npm install
-
-# 2. Playwright ブラウザをインストール
 npx playwright install chromium
-
-# 3. 環境変数を設定
-cp .env.example .env
-# .env を編集して各APIキーを入力
-
-# 4. 初回ログイン（セッション保存）
-npm run login
-# → ブラウザが開くので TikTok にログインし、Enter を押す
 ```
 
-## 使い方
+### 2. Google Cloud サービスアカウントの設定
+1. [Google Cloud Console](https://console.cloud.google.com/) でプロジェクト作成
+2. **APIとサービス** → **有効なAPI** → **Google Sheets API** を有効化
+3. **IAMと管理** → **サービスアカウント** → 新規作成
+4. サービスアカウントの **キー** → **新しいキーを追加 (JSON)** でダウンロード
+5. スプレッドシートの共有設定でサービスアカウントのメールを **編集者** として追加
+
+### 3. 環境変数の設定
+```bash
+cp .env.example .env
+# .env を編集して各値を入力
+```
+
+### 4. Google Sheets を初期化（5シート自動作成）
+```bash
+npm run init-sheets
+```
+
+### 5. TikTok セッションの保存（初回のみ）
+```bash
+npm run login
+# → ブラウザが開くのでログインし、Enter を押してセッション保存
+```
+
+### 6. 起動
+```bash
+npm start   # スケジューラー常駐起動（24時間稼働）
+```
+
+## コマンド一覧
 
 ```bash
-# スケジューラーを起動（24時間稼働）
-npm start
+npm run login           # セッション保存（初回）
+npm run init-sheets     # Sheetsを初期化（初回）
 
-# 即時実行
 npm run invite          # クリエイター招待を今すぐ実行
 npm run recovery        # 商品復旧チェックを今すぐ実行
 npm run weekly-report   # 週次レポートを今すぐ生成・送信
 npm run monthly-report  # 月次レポートを今すぐ生成・送信
-
-# ローカルレポート表示（直近30日の招待実績 & 7日間の違反履歴）
-npm run report
 ```
 
-## 環境変数
+## Google Sheets 5シート構成
 
-| 変数名 | デフォルト | 説明 |
-|--------|-----------|------|
-| `CHATWORK_API_TOKEN` | **必須** | Chatwork API トークン |
-| `CHATWORK_ROOM_ID` | **必須** | アラート送信先ルームID |
-| `CHATWORK_REPORT_ROOM_ID` | = ROOM_ID | レポート送信先ルームID |
-| `ANTHROPIC_API_KEY` | **必須** | Claude API キー（週次・月次レポートのAI分析） |
-| `FILTER_MIN_AVG_VIEWS` | `5000` | 平均視聴数フィルター |
-| `FILTER_MIN_GMV` | `500000` | GMV フィルター（円） |
-| `FILTER_MIN_ENGAGEMENT` | `1.0` | エンゲージメント率フィルター（%） |
-| `INVITE_PER_LETTER` | `50` | 招待状ごとの送信人数 |
-| `INVITE_DELAY_MS` | `2000` | 招待間隔（ms） |
-| `INVITE_CRON` | `0 10 * * *` | 招待 cron (Asia/Tokyo) |
-| `RECOVERY_CRON` | `*/30 * * * *` | 復旧チェック cron |
-| `WEEKLY_REPORT_CRON` | `0 9 * * 1` | 週次レポート cron |
-| `MONTHLY_REPORT_CRON` | `0 9 1 * *` | 月次レポート cron |
-| `HEADLESS` | `false` | ヘッドレスモード |
-| `LOG_LEVEL` | `info` | ログレベル |
+| シート | 内容 | 更新タイミング |
+|--------|------|--------------|
+| **①日次データ** | 日付・招待数①②・合計・実行時刻・エラー | 招待実行後 |
+| **②売上データ** | 日付・承諾数・承諾率・転換率・売上金額・GMV | 別途更新 |
+| **③違反履歴** | 商品ID/名・違反種別・検知日時・再申請・復旧時間・ステータス | 違反検知時 |
+| **④週次サマリー** | 週集計＋AI改善提案 | 週次レポート実行時 |
+| **⑤月次サマリー** | 月集計＋AI改善提案 | 月次レポート実行時 |
 
-## レポートサンプル（Chatwork送信イメージ）
+## Chatworkレポートサンプル
 
 ```
-[TikTok Shop] 週次レポート (2026年4月20日週)
-========================================
+【週次レポート】2026/04/14〜04/20
+招待数：700人 / 承諾率：12.0%（先週比+3.0%）
+売上金額：480万円（先週比+15%）
+GMV変化：+8%
+商品落ち：3件（平均復旧時間12分）
 
-■ クリエイター招待実績
-招待数      : 700人 (前期比: +0)
-承諾率      : 12.5% (前期比: +2.3%)
-売上転換率  : 8.2% (前期比: -0.5%)
-売上金額    : ¥1,250,000 (前期比: +15.2%)
-GMV        : ¥3,800,000 (前期比: +8.5%)
-
-■ 商品ガイドライン違反
-違反検知    : 3件 (前期比: -2)
-復旧済み    : 3件
-平均復旧時間: 42分 (前期比: -25)
-
-■ AIによる分析・改善提案
-今週の承諾率は12.5%（先週比+2.3%）と改善しました。GMVフィルター強化の
-効果が表れています。一方、売上転換率が0.5%低下しており、承諾後のフォロー
+【改善提案】
+今週の承諾率は12%と先週比+3%で改善しました。GMVフィルターの絞り込み
+効果が表れています。ただし売上転換率が低下しており、承諾後のフォロー
 アップが課題です。来週はエンゲージメント率の閾値を1.5%に引き上げ、
-より質の高いクリエイターに絞り込むことを推奨します。
+より購買力の高いクリエイターに絞り込むことを推奨します。
 
-生成日時: 2026-04-21 09:00 JST
+詳細はこちら→ https://docs.google.com/spreadsheets/d/xxxxx
 ```
 
 ## ファイル構成
@@ -101,38 +98,41 @@ GMV        : ¥3,800,000 (前期比: +8.5%)
 │   ├── features/
 │   │   ├── creatorInvite.js        # 機能①：クリエイター自動招待
 │   │   ├── productRecovery.js      # 機能②：商品自動復旧
-│   │   └── reportGenerator.js      # 機能③：週次・月次レポート（Claude API）
-│   ├── db/database.js              # SQLite（招待・売上・GMV・違反履歴）
+│   │   └── reportGenerator.js      # 機能④⑤：週次・月次レポート（Claude API）
+│   ├── sheets/
+│   │   └── googleSheets.js         # Google Sheets API ラッパー（5シート管理）
 │   ├── notifications/
 │   │   ├── chatwork.js             # Chatwork API ラッパー
-│   │   └── notify.js               # 通知ヘルパー関数
+│   │   └── notify.js               # 通知ヘルパー
 │   └── utils/logger.js             # ログ出力
-├── data/                           # DB・セッションファイル（gitignore）
-├── logs/                           # ログファイル（gitignore）
-└── .env                            # 環境変数（gitignore）
+├── data/
+│   ├── sessions/                   # TikTokセッション（gitignore）
+│   └── invited_creators.json       # 招待済みクリエイターキャッシュ（gitignore）
+└── logs/                           # ログファイル（gitignore）
 ```
 
-## データベース
+## 環境変数
 
-SQLite (`data/tiktok_bot.db`) に以下のテーブルを自動作成します。
-
-| テーブル | 内容 |
-|---------|------|
-| `creator_invitations` | 招待履歴・承諾状況・売上金額・GMV |
-| `invitation_runs` | 招待バッチ実行ログ |
-| `product_violations` | 違反商品の検知・再申請・復旧時間 |
-| `product_monitor_logs` | 監視バッチ実行ログ |
-
-## Chatwork API キーの取得方法
-
-1. Chatwork にログイン
-2. 右上のアカウント名 → **「サービス連携」** → **「API Token」**
-3. 発行されたトークンを `CHATWORK_API_TOKEN` に設定
-4. ルームID: Chatwork のルームを開き URL の `#!rid` 以降の数字
+| 変数名 | 必須 | 説明 |
+|--------|------|------|
+| `TIKTOK_EMAIL` | ✓ | TikTokアカウントのメールアドレス |
+| `TIKTOK_PASSWORD` | ✓ | TikTokアカウントのパスワード |
+| `CHATWORK_API_TOKEN` | ✓ | Chatwork APIトークン |
+| `CHATWORK_ROOM_ID` | ✓ | アラート送信先ルームID |
+| `CHATWORK_REPORT_ROOM_ID` | | レポート送信先ルームID（省略可） |
+| `ANTHROPIC_API_KEY` | ✓ | Claude APIキー |
+| `GOOGLE_SHEETS_ID` | ✓ | スプレッドシートID |
+| `GOOGLE_SERVICE_ACCOUNT_KEY` | ✓ | サービスアカウントJSONキーのパス |
+| `FILTER_MIN_AVG_VIEWS` | | 平均視聴数下限（デフォルト: 5000） |
+| `FILTER_MIN_GMV` | | GMV下限・円（デフォルト: 500000） |
+| `FILTER_MIN_ENGAGEMENT` | | エンゲージメント率下限・%（デフォルト: 1.0） |
+| `INVITE_PER_LETTER` | | 招待状ごとの送信人数（デフォルト: 50） |
+| `INVITE_DELAY_MS` | | 招待間隔ms（デフォルト: 2000） |
+| `HEADLESS` | | ヘッドレスモード（デフォルト: false） |
 
 ## 注意事項
 
-- **初回のみ手動ログインが必要**です（`npm run login`）。以降はセッションが自動復元されます。
-- TikTok の UI 変更でセレクターが壊れる場合は各 feature ファイルの `SELECTORS` を更新してください。
-- セッションファイル (`data/sessions/`) には認証情報が含まれます。外部に漏洩しないよう管理してください。
-- Claude API の利用には Anthropic アカウントとクレジットが必要です。レポートの AI 分析のみに使用します。
+- **初回のみ** `npm run login` と `npm run init-sheets` が必要です
+- Sheet②（売上データ）は TikTok アフィリエイトダッシュボードから手動または別途スクレイピングで更新してください
+- サービスアカウントキー (`*.json`) は機密情報です。`.gitignore` に追加し外部に漏洩しないよう管理してください
+- TikTok UIの変更でセレクターが壊れた場合は各 feature ファイルの `SELECTORS` を更新してください

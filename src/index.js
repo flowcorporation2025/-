@@ -1,3 +1,4 @@
+'use strict';
 require('dotenv').config();
 const cron = require('node-cron');
 const logger = require('./utils/logger');
@@ -5,7 +6,7 @@ const { runCreatorInvite } = require('./features/creatorInvite');
 const { runProductRecovery } = require('./features/productRecovery');
 const { runWeeklyReport, runMonthlyReport } = require('./features/reportGenerator');
 const { getAuthenticatedPage, saveSession, TIKTOK_SELLER_URL } = require('./auth/session');
-const db = require('./db/database');
+const sheets = require('./sheets/googleSheets');
 
 const args = process.argv.slice(2);
 const taskArg = args.find((a) => a.startsWith('--task='))?.split('=')[1];
@@ -16,7 +17,7 @@ const RECOVERY_CRON       = process.env.RECOVERY_CRON       ?? '*/30 * * * *'; /
 const WEEKLY_REPORT_CRON  = process.env.WEEKLY_REPORT_CRON  ?? '0 9 * * 1';   // Mon 09:00
 const MONTHLY_REPORT_CRON = process.env.MONTHLY_REPORT_CRON ?? '0 9 1 * *';   // 1st 09:00
 
-// ── One-shot task runner ─────────────────────────────────────────────────────
+// ── One-shot task runner ──────────────────────────────────────────────────────
 async function runTask(task) {
   switch (task) {
     case 'login': {
@@ -27,6 +28,12 @@ async function runTask(task) {
       logger.info('セッション保存完了。次回から自動ログインが使用されます。');
       break;
     }
+
+    case 'init-sheets':
+      logger.info('Google Sheetsを初期化します（5シート + ヘッダー作成）');
+      await sheets.initSheets();
+      logger.info(`スプレッドシートURL: ${sheets.getSpreadsheetUrl()}`);
+      break;
 
     case 'invite':
       logger.info('クリエイター招待を即時実行します');
@@ -48,42 +55,26 @@ async function runTask(task) {
       await runMonthlyReport();
       break;
 
-    case 'report': {
-      const stats = db.getInvitationStats(30);
-      const violations = db.getViolationHistory(7);
-      logger.info('=== 招待レポート (直近30日) ===');
-      logger.info(`招待総数: ${stats.total_invited}人`);
-      logger.info(`承諾数: ${stats.accepted}人`);
-      logger.info(`承諾率: ${stats.acceptance_rate}%`);
-      logger.info(`売上転換率: ${stats.conversion_rate}%`);
-      logger.info(`売上金額: ¥${stats.total_sales}`);
-      logger.info(`GMV: ¥${stats.total_gmv}`);
-      logger.info('=== 違反商品履歴 (直近7日) ===');
-      violations.forEach((v) => {
-        logger.info(`[${v.detected_at}] ${v.product_name} - ${v.violation_type} → ${v.reapply_status}`);
-      });
-      break;
-    }
-
     default:
       logger.error(
-        `不明なタスク: ${task}. 使用可能: login, invite, recovery, weekly-report, monthly-report, report`
+        `不明なタスク: ${task}\n使用可能: login, init-sheets, invite, recovery, weekly-report, monthly-report`
       );
       process.exit(1);
   }
 }
 
-// ── Scheduler ────────────────────────────────────────────────────────────────
-function startScheduler() {
+// ── Scheduler ─────────────────────────────────────────────────────────────────
+async function startScheduler() {
   logger.info('スケジューラー起動 (Asia/Tokyo)');
   logger.info(`クリエイター招待    : ${INVITE_CRON}`);
   logger.info(`商品復旧チェック    : ${RECOVERY_CRON}`);
   logger.info(`週次レポート        : ${WEEKLY_REPORT_CRON}`);
   logger.info(`月次レポート        : ${MONTHLY_REPORT_CRON}`);
 
-  db.getDb();
+  // Ensure Sheets are ready before any job runs
+  await sheets.initSheets();
 
-  const schedule = (cronExpr, label, fn) => {
+  const schedule = (cronExpr, label, fn) =>
     cron.schedule(
       cronExpr,
       async () => {
@@ -96,7 +87,6 @@ function startScheduler() {
       },
       { timezone: 'Asia/Tokyo' }
     );
-  };
 
   schedule(INVITE_CRON,         'クリエイター招待',   runCreatorInvite);
   schedule(RECOVERY_CRON,       '商品復旧チェック',   runProductRecovery);
@@ -117,6 +107,6 @@ function startScheduler() {
     }
     process.exit(0);
   } else {
-    startScheduler();
+    await startScheduler();
   }
 })();

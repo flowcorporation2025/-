@@ -1,20 +1,20 @@
 {
   "name": "tiktok-shop-automation-bot",
-  "version": "1.0.0",
-  "description": "TikTok Shop affiliate center automation bot using Playwright",
+  "version": "3.0.0",
+  "description": "TikTok Shop affiliate center automation bot — Playwright + Google Sheets + Chatwork + Claude AI",
   "main": "src/index.js",
   "scripts": {
     "start": "node src/index.js",
+    "login": "node src/index.js --task=login",
+    "init-sheets": "node src/index.js --task=init-sheets",
     "invite": "node src/index.js --task=invite",
     "recovery": "node src/index.js --task=recovery",
-    "login": "node src/index.js --task=login",
-    "report": "node src/index.js --task=report",
     "weekly-report": "node src/index.js --task=weekly-report",
     "monthly-report": "node src/index.js --task=monthly-report"
   },
   "dependencies": {
     "playwright": "^1.44.0",
-    "better-sqlite3": "^9.6.0",
+    "googleapis": "^140.0.0",
     "node-cron": "^3.0.3",
     "dotenv": "^16.4.5",
     "axios": "^1.7.2",

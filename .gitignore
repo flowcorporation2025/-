@@ -1,7 +1,8 @@
 node_modules/
 .env
 data/sessions/
-data/*.db
+data/invited_creators.json
 logs/
 *.log
 .DS_Store
+*.json.bak
