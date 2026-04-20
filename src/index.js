@@ -5,7 +5,7 @@ const logger = require('./utils/logger');
 const { runCreatorInvite } = require('./features/creatorInvite');
 const { runProductRecovery } = require('./features/productRecovery');
 const { runWeeklyReport, runMonthlyReport } = require('./features/reportGenerator');
-const { getAuthenticatedPage, saveSession, TIKTOK_SELLER_URL } = require('./auth/session');
+const { runLoginFlow, TIKTOK_SELLER_URL } = require('./auth/session');
 const sheets = require('./sheets/googleSheets');
 
 const args = process.argv.slice(2);
@@ -20,14 +20,10 @@ const MONTHLY_REPORT_CRON = process.env.MONTHLY_REPORT_CRON ?? '0 9 1 * *';   //
 // ── One-shot task runner ──────────────────────────────────────────────────────
 async function runTask(task) {
   switch (task) {
-    case 'login': {
-      logger.info('手動ログイン & セッション保存モード');
-      const { browser, context } = await getAuthenticatedPage(TIKTOK_SELLER_URL);
-      await saveSession(context);
-      await browser.close();
-      logger.info('セッション保存完了。次回から自動ログインが使用されます。');
+    case 'login':
+      logger.info('手動ログインモード: ブラウザが開きます');
+      await runLoginFlow();
       break;
-    }
 
     case 'init-sheets':
       logger.info('Google Sheetsを初期化します（5シート + ヘッダー作成）');

@@ -9,106 +9,165 @@ const SESSION_FILE = path.join(SESSION_DIR, 'tiktok_session.json');
 const TIKTOK_SELLER_URL = 'https://seller.tiktokglobalshop.com';
 const TIKTOK_AFFILIATE_URL = 'https://affiliate.tiktokglobalshop.com';
 
-async function launchBrowser(headless = false) {
-  const browser = await chromium.launch({
+// URLs that indicate the user is NOT yet logged in
+const LOGIN_URL_PATTERNS = ['login', 'passport', 'account/login', 'auth/login'];
+
+function isLoginUrl(url) {
+  return LOGIN_URL_PATTERNS.some((p) => url.includes(p));
+}
+
+// ── Browser / context factories ───────────────────────────────────────────────
+
+async function launchBrowser({ headless = false } = {}) {
+  return chromium.launch({
     headless,
     args: [
       '--no-sandbox',
       '--disable-setuid-sandbox',
       '--disable-blink-features=AutomationControlled',
+      '--disable-infobars',
     ],
+    // Ensure the browser window is visible and large enough during manual login
+    ...(!headless && { slowMo: 0 }),
   });
-  return browser;
 }
 
-async function createContext(browser) {
-  if (!fs.existsSync(SESSION_DIR)) {
-    fs.mkdirSync(SESSION_DIR, { recursive: true });
-  }
+/**
+ * Create a browser context.
+ * @param {import('playwright').Browser} browser
+ * @param {{ forLogin?: boolean }} options
+ *   forLogin=true  → fresh context, no session loaded, no resource blocking
+ *                    (needed so CAPTCHA images render correctly)
+ *   forLogin=false → load saved session, block heavy resources for speed
+ */
+async function createContext(browser, { forLogin = false } = {}) {
+  if (!fs.existsSync(SESSION_DIR)) fs.mkdirSync(SESSION_DIR, { recursive: true });
 
   const contextOptions = {
     viewport: { width: 1280, height: 800 },
     userAgent:
-      'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+      'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 ' +
+      '(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
     locale: 'ja-JP',
     timezoneId: 'Asia/Tokyo',
   };
 
-  if (fs.existsSync(SESSION_FILE)) {
+  if (!forLogin && fs.existsSync(SESSION_FILE)) {
     logger.info('既存セッションを読み込み中...');
     contextOptions.storageState = SESSION_FILE;
   }
 
   const context = await browser.newContext(contextOptions);
 
-  // Block unnecessary resources to speed up
-  await context.route('**/*.{png,jpg,jpeg,gif,webp,svg,ico,woff,woff2,ttf}', (route) =>
-    route.abort()
-  );
+  // Block heavy resources only during normal automation (not during login,
+  // where CAPTCHA images must load)
+  if (!forLogin) {
+    await context.route('**/*.{png,jpg,jpeg,gif,webp,svg,ico,woff,woff2,ttf}', (route) =>
+      route.abort()
+    );
+  }
 
   return context;
 }
 
 async function saveSession(context) {
-  if (!fs.existsSync(SESSION_DIR)) {
-    fs.mkdirSync(SESSION_DIR, { recursive: true });
-  }
+  if (!fs.existsSync(SESSION_DIR)) fs.mkdirSync(SESSION_DIR, { recursive: true });
   await context.storageState({ path: SESSION_FILE });
-  logger.info(`セッションを保存しました: ${SESSION_FILE}`);
+  logger.info(`セッション保存完了: ${SESSION_FILE}`);
 }
+
+// ── Login detection ───────────────────────────────────────────────────────────
 
 async function isLoggedIn(page, targetUrl = TIKTOK_SELLER_URL) {
   try {
     await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
     await page.waitForTimeout(2000);
-    const currentUrl = page.url();
-    // If redirected to login page, session is invalid
-    if (currentUrl.includes('login') || currentUrl.includes('passport')) {
-      return false;
-    }
-    return true;
+    return !isLoginUrl(page.url());
   } catch {
     return false;
   }
 }
 
-async function performLogin(page) {
-  logger.info('手動ログインモード: ブラウザでTikTokにログインしてください。');
-  logger.info(`ログインURL: ${TIKTOK_SELLER_URL}`);
-  await page.goto(TIKTOK_SELLER_URL, { waitUntil: 'domcontentloaded', timeout: 60000 });
+/**
+ * Open a visible browser, navigate to TikTok, and wait for the user to
+ * complete login (including any CAPTCHA) without any terminal interaction.
+ *
+ * Completion is detected automatically when the URL moves away from a
+ * login/passport page and the seller dashboard becomes visible.
+ *
+ * @param {import('playwright').Page} page
+ * @param {number} timeoutMs  Maximum wait time (default: 5 minutes)
+ */
+async function performLogin(page, timeoutMs = 5 * 60 * 1000) {
+  logger.info('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
+  logger.info('  手動ログインモード');
+  logger.info('  ブラウザが開きます。TikTok Shopにログインしてください。');
+  logger.info('  CAPTCHA・2段階認証も画面上で完了させてください。');
+  logger.info('  ログイン完了後、自動的にセッションが保存されます。');
+  logger.info('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
 
-  logger.info('ログインが完了したらEnterキーを押してください...');
-  await new Promise((resolve) => {
-    process.stdin.setRawMode(true);
-    process.stdin.resume();
-    process.stdin.once('data', () => {
-      process.stdin.setRawMode(false);
-      process.stdin.pause();
-      resolve();
-    });
-  });
+  await page.goto(TIKTOK_SELLER_URL, { waitUntil: 'domcontentloaded', timeout: 30000 });
+
+  // Wait until the page URL is no longer a login/passport URL
+  logger.info('ログイン完了を待機中... (最大5分)');
+  await page.waitForURL(
+    (url) => !isLoginUrl(url.href),
+    { timeout: timeoutMs, waitUntil: 'domcontentloaded' }
+  );
+
+  // Extra buffer for post-login redirects to settle
+  await page.waitForTimeout(2000);
+  logger.info(`ログイン検知: ${page.url()}`);
 }
 
+// ── Public API ────────────────────────────────────────────────────────────────
+
+/**
+ * Run the interactive login flow:
+ *   1. Launch a visible (headful) browser — always, regardless of HEADLESS env
+ *   2. Wait for the user to complete login (incl. CAPTCHA) in the GUI
+ *   3. Save the session to disk
+ *
+ * Called only from `npm run login`.
+ */
+async function runLoginFlow() {
+  // Always headful for manual login regardless of HEADLESS env var
+  const browser = await launchBrowser({ headless: false });
+  const context = await createContext(browser, { forLogin: true });
+  const page = await context.newPage();
+
+  try {
+    await performLogin(page);
+    await saveSession(context);
+    logger.info('セッション保存完了。次回からは自動ログインが使用されます。');
+  } finally {
+    await context.close().catch(() => null);
+    await browser.close().catch(() => null);
+  }
+}
+
+/**
+ * Get an authenticated page, reusing a saved session if valid.
+ * Falls back to runLoginFlow() if the session has expired.
+ */
 async function getAuthenticatedPage(targetUrl = TIKTOK_SELLER_URL) {
-  const browser = await launchBrowser(process.env.HEADLESS === 'true');
-  const context = await createContext(browser);
+  const browser = await launchBrowser({ headless: process.env.HEADLESS === 'true' });
+  const context = await createContext(browser, { forLogin: false });
   const page = await context.newPage();
 
   const loggedIn = await isLoggedIn(page, targetUrl);
 
   if (!loggedIn) {
-    logger.warn('セッションが無効です。手動ログインが必要です。');
-    await performLogin(page);
-    await saveSession(context);
+    logger.warn('セッション期限切れ。再ログインが必要です。');
+    await context.close().catch(() => null);
+    await browser.close().catch(() => null);
 
-    const recheck = await isLoggedIn(page, targetUrl);
-    if (!recheck) {
-      throw new Error('ログインに失敗しました。再試行してください。');
-    }
-  } else {
-    logger.info('セッション有効。自動ログイン成功。');
+    // Re-run the full interactive login flow, then retry
+    await runLoginFlow();
+    return getAuthenticatedPage(targetUrl);
   }
 
+  logger.info('セッション有効。自動ログイン成功。');
   return { browser, context, page };
 }
 
@@ -118,6 +177,7 @@ module.exports = {
   saveSession,
   isLoggedIn,
   performLogin,
+  runLoginFlow,
   getAuthenticatedPage,
   TIKTOK_SELLER_URL,
   TIKTOK_AFFILIATE_URL,
