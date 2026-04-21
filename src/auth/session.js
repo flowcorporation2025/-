@@ -9,11 +9,27 @@ const SESSION_FILE = path.join(SESSION_DIR, 'tiktok_session.json');
 const TIKTOK_SELLER_URL = 'https://seller.tiktokglobalshop.com';
 const TIKTOK_AFFILIATE_URL = 'https://affiliate.tiktokglobalshop.com';
 
-// URLs that indicate the user is NOT yet logged in
-const LOGIN_URL_PATTERNS = ['login', 'passport', 'account/login', 'auth/login'];
+// URL fragments that indicate an authentication/login page
+const LOGIN_URL_PATTERNS = ['login', 'passport', 'account/login', 'auth/login', 'signin'];
 
 function isLoginUrl(url) {
-  return LOGIN_URL_PATTERNS.some((p) => url.includes(p));
+  return LOGIN_URL_PATTERNS.some((p) => url.toLowerCase().includes(p));
+}
+
+/**
+ * Returns true only when the URL is definitively the seller dashboard.
+ * Using the seller hostname as a strict anchor prevents false positives from
+ * intermediate OAuth redirect URLs that don't contain "login" keywords.
+ */
+function isDashboardUrl(urlStr) {
+  try {
+    const { hostname } = new URL(urlStr);
+    // Matches seller.tiktokglobalshop.com or seller-XX.tiktokglobalshop.com
+    const isSellerDomain = /^seller(-\w+)?\.tiktokglobalshop\.com$/.test(hostname);
+    return isSellerDomain && !isLoginUrl(urlStr);
+  } catch {
+    return false;
+  }
 }
 
 // ── Browser / context factories ───────────────────────────────────────────────
@@ -81,10 +97,10 @@ async function saveSession(context) {
 async function isLoggedIn(page, targetUrl = TIKTOK_SELLER_URL) {
   try {
     await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
-    // Wait for potential client-side (SPA) redirects to complete
+    // Wait for SPA client-side redirects to complete before checking the URL
     await page.waitForLoadState('networkidle', { timeout: 10000 }).catch(() => null);
     await page.waitForTimeout(1000);
-    return !isLoginUrl(page.url());
+    return isDashboardUrl(page.url());
   } catch {
     return false;
   }
@@ -105,31 +121,50 @@ async function performLogin(page, timeoutMs = 5 * 60 * 1000) {
   logger.info('  手動ログインモード');
   logger.info('  ブラウザが開きます。TikTok Shopにログインしてください。');
   logger.info('  CAPTCHA・2段階認証も画面上で完了させてください。');
-  logger.info('  ログイン完了後、自動的にセッションが保存されます。');
+  logger.info('  ダッシュボードが表示されたら自動的にセッションを保存します。');
   logger.info('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
 
-  await page.goto(TIKTOK_SELLER_URL, { waitUntil: 'domcontentloaded', timeout: 30000 });
+  // Navigate to seller center — TikTok will redirect to the login page automatically.
+  // Ignore navigation errors here; what matters is where we end up, not how we got there.
+  await page.goto(TIKTOK_SELLER_URL, { waitUntil: 'domcontentloaded', timeout: 30000 })
+    .catch((err) => logger.warn(`初期ナビゲーションエラー (無視): ${err.message}`));
 
-  // Wait until the URL leaves any login/passport page
-  logger.info('ログイン完了を待機中... (最大5分)');
-  await page.waitForURL(
-    (url) => !isLoginUrl(url.href),
-    { timeout: timeoutMs, waitUntil: 'domcontentloaded' }
-  );
+  // ── Poll for the dashboard URL (every 2 seconds) ───────────────────────────
+  // WHY polling instead of page.waitForURL():
+  //   waitForURL() fires on every navigation event, including intermediate OAuth
+  //   redirect hops whose URLs happen not to contain "login"/"passport".
+  //   That caused the browser to close while the user was still typing their email.
+  //   Polling checks the CURRENT settled URL, not transient navigation events.
+  logger.info('ダッシュボードURLの検出を待機中... (最大5分)');
 
-  // Wait for the dashboard to fully settle:
-  // - networkidle ensures background XHR/fetch (including cookie-setting requests) finish
-  // - extra 3s buffer for any remaining async JS
-  logger.info('ダッシュボード読み込み中...');
+  const deadline = Date.now() + timeoutMs;
+  let detected = false;
+
+  while (Date.now() < deadline) {
+    try {
+      const currentUrl = page.url();
+      if (isDashboardUrl(currentUrl)) {
+        logger.info(`ダッシュボードURL検出: ${currentUrl}`);
+        detected = true;
+        break;
+      }
+      logger.debug(`待機中 (${Math.round((deadline - Date.now()) / 1000)}秒残) URL: ${currentUrl}`);
+    } catch {
+      // page may be briefly unavailable during a navigation; just retry
+    }
+    await page.waitForTimeout(2000);
+  }
+
+  if (!detected) {
+    throw new Error('タイムアウト: 5分以内にダッシュボードが検出されませんでした。再度 npm run login を実行してください。');
+  }
+
+  // Wait for post-login background requests (cookie-setting XHR etc.) to finish
+  logger.info('ページ安定化待機中...');
   await page.waitForLoadState('networkidle', { timeout: 15000 }).catch(() => null);
   await page.waitForTimeout(3000);
 
-  // Sanity check: confirm we did NOT end up back on a login page
-  const finalUrl = page.url();
-  if (isLoginUrl(finalUrl)) {
-    throw new Error('ログイン後にログインページへ戻りました。CAPTCHA / 2段階認証が未完了の可能性があります。');
-  }
-  logger.info(`ログイン完了確認: ${finalUrl}`);
+  logger.info(`ログイン完了: ${page.url()}`);
 }
 
 // ── Public API ────────────────────────────────────────────────────────────────
