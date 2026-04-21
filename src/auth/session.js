@@ -1,6 +1,7 @@
 const { chromium } = require('playwright');
 const path = require('path');
 const fs = require('fs');
+const readline = require('readline');
 const logger = require('../utils/logger');
 
 const SESSION_DIR = path.join(process.cwd(), 'data', 'sessions');
@@ -9,27 +10,30 @@ const SESSION_FILE = path.join(SESSION_DIR, 'tiktok_session.json');
 const TIKTOK_SELLER_URL = 'https://seller.tiktokglobalshop.com';
 const TIKTOK_AFFILIATE_URL = 'https://affiliate.tiktokglobalshop.com';
 
-// URL fragments that indicate an authentication/login page
 const LOGIN_URL_PATTERNS = ['login', 'passport', 'account/login', 'auth/login', 'signin'];
 
 function isLoginUrl(url) {
   return LOGIN_URL_PATTERNS.some((p) => url.toLowerCase().includes(p));
 }
 
-/**
- * Returns true only when the URL is definitively the seller dashboard.
- * Using the seller hostname as a strict anchor prevents false positives from
- * intermediate OAuth redirect URLs that don't contain "login" keywords.
- */
 function isDashboardUrl(urlStr) {
   try {
     const { hostname } = new URL(urlStr);
-    // Matches seller.tiktokglobalshop.com or seller-XX.tiktokglobalshop.com
     const isSellerDomain = /^seller(-\w+)?\.tiktokglobalshop\.com$/.test(hostname);
     return isSellerDomain && !isLoginUrl(urlStr);
   } catch {
     return false;
   }
+}
+
+function waitForEnter() {
+  return new Promise((resolve) => {
+    const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+    rl.question('', () => {
+      rl.close();
+      resolve();
+    });
+  });
 }
 
 // ── Browser / context factories ───────────────────────────────────────────────
@@ -43,8 +47,6 @@ async function launchBrowser({ headless = false } = {}) {
       '--disable-blink-features=AutomationControlled',
       '--disable-infobars',
     ],
-    // Ensure the browser window is visible and large enough during manual login
-    ...(!headless && { slowMo: 0 }),
   });
 }
 
@@ -106,95 +108,42 @@ async function isLoggedIn(page, targetUrl = TIKTOK_SELLER_URL) {
   }
 }
 
-/**
- * Open a visible browser, navigate to TikTok, and wait for the user to
- * complete login (including any CAPTCHA) without any terminal interaction.
- *
- * Completion is detected automatically when the URL moves away from a
- * login/passport page and the seller dashboard becomes visible.
- *
- * @param {import('playwright').Page} page
- * @param {number} timeoutMs  Maximum wait time (default: 5 minutes)
- */
-async function performLogin(page, timeoutMs = 5 * 60 * 1000) {
+async function performLogin(page) {
   logger.info('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
   logger.info('  手動ログインモード');
   logger.info('  ブラウザが開きます。TikTok Shopにログインしてください。');
   logger.info('  CAPTCHA・2段階認証も画面上で完了させてください。');
-  logger.info('  ダッシュボードが表示されたら自動的にセッションを保存します。');
+  logger.info('  ダッシュボードが表示されたら、このターミナルで Enter を押してください。');
   logger.info('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
 
-  // Navigate to seller center — TikTok will redirect to the login page automatically.
-  // Ignore navigation errors here; what matters is where we end up, not how we got there.
   await page.goto(TIKTOK_SELLER_URL, { waitUntil: 'domcontentloaded', timeout: 30000 })
     .catch((err) => logger.warn(`初期ナビゲーションエラー (無視): ${err.message}`));
 
-  // ── Poll for the dashboard URL (every 2 seconds) ───────────────────────────
-  // WHY polling instead of page.waitForURL():
-  //   waitForURL() fires on every navigation event, including intermediate OAuth
-  //   redirect hops whose URLs happen not to contain "login"/"passport".
-  //   That caused the browser to close while the user was still typing their email.
-  //   Polling checks the CURRENT settled URL, not transient navigation events.
-  logger.info('ダッシュボードURLの検出を待機中... (最大5分)');
-
-  const deadline = Date.now() + timeoutMs;
-  let detected = false;
-
-  while (Date.now() < deadline) {
-    try {
-      const currentUrl = page.url();
-      if (isDashboardUrl(currentUrl)) {
-        logger.info(`ダッシュボードURL検出: ${currentUrl}`);
-        detected = true;
-        break;
-      }
-      logger.debug(`待機中 (${Math.round((deadline - Date.now()) / 1000)}秒残) URL: ${currentUrl}`);
-    } catch {
-      // page may be briefly unavailable during a navigation; just retry
-    }
-    await page.waitForTimeout(2000);
-  }
-
-  if (!detected) {
-    throw new Error('タイムアウト: 5分以内にダッシュボードが検出されませんでした。再度 npm run login を実行してください。');
-  }
-
-  // Wait for post-login background requests (cookie-setting XHR etc.) to finish
-  logger.info('ページ安定化待機中...');
-  await page.waitForLoadState('networkidle', { timeout: 15000 }).catch(() => null);
-  await page.waitForTimeout(3000);
-
-  logger.info(`ログイン完了: ${page.url()}`);
+  logger.info('ログインが完了したら Enter を押してください...');
+  await waitForEnter();
+  logger.info(`Enter 検知。現在のURL: ${page.url()}`);
 }
 
 // ── Public API ────────────────────────────────────────────────────────────────
 
-/**
- * Run the interactive login flow:
- *   1. Launch a visible (headful) browser — always, regardless of HEADLESS env
- *   2. Wait for the user to complete login (incl. CAPTCHA) in the GUI
- *   3. Save the session to disk
- *
- * Called only from `npm run login`.
- */
 async function runLoginFlow() {
-  // Always headful for manual login regardless of HEADLESS env var
   const browser = await launchBrowser({ headless: false });
   const context = await createContext(browser, { forLogin: true });
   const page = await context.newPage();
 
+  // ブラウザはセッション保存が完全に完了するまで閉じない
   try {
     await performLogin(page);
+    logger.info('セッションを保存中...');
     await saveSession(context);
-    logger.info('セッションファイル書き込み完了。検証中...');
+    logger.info('セッション保存完了。ブラウザを閉じます。');
   } finally {
     await context.close().catch(() => null);
     await browser.close().catch(() => null);
   }
 
-  // ── Verify the saved session file with a brand-new browser context ──────────
-  // This is the only reliable test: load the exact file that was just written,
-  // navigate to the seller top, and confirm we are NOT redirected to login.
+  // 保存したセッションファイルを別の新規ブラウザで検証
+  logger.info('セッションを検証中...');
   const verifyBrowser = await launchBrowser({ headless: true });
   try {
     const verifyContext = await verifyBrowser.newContext({
@@ -216,11 +165,10 @@ async function runLoginFlow() {
     await verifyContext.close().catch(() => null);
 
     if (isLoginUrl(verifyUrl)) {
-      // Delete the invalid session file so stale data doesn't interfere next time
       fs.rmSync(SESSION_FILE, { force: true });
       throw new Error(
         'セッション検証に失敗しました（保存後もログインページに遷移します）。\n' +
-        '再度 npm run login を実行し、ダッシュボードが完全に表示された状態で待ってください。'
+        'ダッシュボードが完全に表示された状態で Enter を押してください。'
       );
     }
 
