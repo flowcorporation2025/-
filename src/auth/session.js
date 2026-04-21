@@ -19,7 +19,7 @@ function isLoginUrl(url) {
 function isDashboardUrl(urlStr) {
   try {
     const { hostname } = new URL(urlStr);
-    const isSellerDomain = /^seller(-\w+)?\.tiktokglobalshop\.com$/.test(hostname);
+    const isSellerDomain = /^seller(-\w+)?\.(tiktokglobalshop|tiktokshopglobalselling|tiktokshop)\.com$/.test(hostname);
     return isSellerDomain && !isLoginUrl(urlStr);
   } catch {
     return false;
@@ -164,10 +164,10 @@ async function runLoginFlow() {
     const verifyUrl = verifyPage.url();
     await verifyContext.close().catch(() => null);
 
-    if (isLoginUrl(verifyUrl)) {
+    if (!isDashboardUrl(verifyUrl)) {
       fs.rmSync(SESSION_FILE, { force: true });
       throw new Error(
-        'セッション検証に失敗しました（保存後もログインページに遷移します）。\n' +
+        `セッション検証に失敗しました（遷移先: ${verifyUrl}）。\n` +
         'ダッシュボードが完全に表示された状態で Enter を押してください。'
       );
     }
